@@ -8,14 +8,47 @@ iperf3_bin/
 *.pyc
 __pycache__/
 
-# Vivado
-vivado.jou
-vivado.log
-*.jou
-*.log
-
 # 文档缓存
 ip_docs/
 
 # 临时文件
 $null
+
+# Vivado 自动生成的文件和目录
+project/
+ip_project/
+*.jou
+*.log
+*.str
+*.xpe
+.cache/
+.hw
+.sim/
+*ip_user_files/
+.gen
+.runs/
+.srcs/
+.sdk/
+.tmp
+*hwdef
+*.xpr.lock
+*xpr.ip_user_files/
+
+# 编译结果和中间文件
+*.bit
+*.mcs
+*.prm
+*.bin
+*.rpt
+*.dcp
+*.ltx
+*.hdf
+*.sysdef
+
+# IP 产生的文件
+*.xcix
+.*/ip/*
+.*/bd/*/ip/*
+
+# Vivado 工程设置
+.xpr.user
