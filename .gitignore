@@ -1,0 +1,41 @@
+# Vivado 自动生成的文件和目录
+project/
+ip_project/
+*.jou
+*.log
+*.str
+*.xpe
+.cache/
+.hw
+.sim/
+*ip_user_files/
+.gen
+.runs/
+.srcs/
+.sdk/
+.tmp
+*hwdef
+*.xpr.lock
+*xpr.ip_user_files/
+
+# 编译结果和中间文件
+*.bit
+*.mcs
+*.prm
+*.bin
+*.rpt
+*.dcp
+*.ltx
+*.hdf
+*.sysdef
+
+# IP 产生的文件
+*.xcix
+.*/ip/*
+.*/bd/*/ip/*
+
+# 检查点文件
+*.dcp
+
+# Vivado 工程设置
+.xpr.user
