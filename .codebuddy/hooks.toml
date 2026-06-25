@@ -1,0 +1,6 @@
+workspace = "c:/Users/tasson/Desktop/tool/tool"
+
+[hooks]
+# 每次编辑完成后, 调用清理 hook
+# 注: CodeBuddy 自身会在每次 replace_in_file / write_to_file 后自动执行钩子脚本
+post_edit = ".codebuddy/hooks/cleanup-temp.ps1"
