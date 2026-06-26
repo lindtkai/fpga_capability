@@ -12,6 +12,7 @@ import re
 import csv
 import threading
 import datetime
+import time
 import subprocess
 import json
 import shutil
@@ -56,7 +57,7 @@ def _patched_subprocess_run(*args, **kwargs):
             env = {**os.environ, **env}
         env.setdefault('GIT_SSH_COMMAND',
             'ssh -o BatchMode=yes -o ConnectTimeout=10'
-            ' -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=NUL')
+            ' -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null')
         kwargs['env'] = env
 
     if not retryable:
@@ -85,7 +86,62 @@ def _patched_subprocess_run(*args, **kwargs):
 subprocess.run = _patched_subprocess_run
 
 
+def _detect_reachable_url(ssh_url, https_url, timeout=10):
+    """并行检测 SSH 和 HTTPS, 先通的先用, 两条路都保留.
+    返回: (url, protocol) 或 (None, None)"""
+    if not ssh_url and not https_url:
+        return None, None
+    if not ssh_url:
+        return (https_url, 'https')  # 只有一条路就直接走
+    if not https_url:
+        return (ssh_url, 'ssh')
 
+    result = {}
+
+    def _git_test(url, proto):
+        env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'Never'}
+        if proto == 'ssh':
+            env['GIT_SSH_COMMAND'] = 'ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new'
+        try:
+            r = subprocess.run(
+                ['git', 'ls-remote', '--heads', url],
+                capture_output=True, text=True, timeout=timeout, env=env)
+            if r.returncode == 0:
+                result[proto] = url
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+
+    t1 = threading.Thread(target=_git_test, args=(ssh_url, 'ssh'))
+    t2 = threading.Thread(target=_git_test, args=(https_url, 'https'))
+    t1.daemon = t2.daemon = True
+    t1.start(); t2.start()
+
+    deadline = time.time() + timeout + 3
+    while time.time() < deadline:
+        # 谁先通用谁, SSH 和 HTTPS 平等
+        for proto in ('ssh', 'https'):
+            if proto in result:
+                return result[proto], proto
+        time.sleep(0.1)
+    return None, None
+
+
+def _url_to_ssh_and_https(url):
+    """从 git URL 推导出对应的 SSH 和 HTTPS 地址."""
+    url = url.strip()
+    ssh = https = None
+    if url.startswith('git@'):
+        # SSH → 推导 HTTPS
+        ssh = url
+        parts = url.replace('git@', '').replace(':', '/', 1).replace('.git', '')
+        https = f'https://{parts}.git'
+    elif url.startswith('https://') or url.startswith('http://'):
+        https = url
+        # HTTPS → 推导 SSH
+        parts = url.replace('https://', '').replace('http://', '').replace('.git', '')
+        host, _, path = parts.partition('/')
+        ssh = f'git@{host}:{path}.git'
+    return ssh, https
 
 # ── 向上查找 .git 目录, 返回仓库根路径; 找不到返回 None ──
 def _find_git_root(start):
@@ -1488,18 +1544,26 @@ def run_gui():
     t3_user_var = tk.StringVar(value='检测中...')
 
     def t3_check_git_user():
-        """读取全局 git 配置, 更新状态显示"""
+        """读取 git 配置 (优先本地仓库, 回退全局), 更新状态显示"""
         gu = ge = ''
-        try:
-            r = subprocess.run(['git', 'config', '--global', 'user.name'],
-                              capture_output=True, text=True)
-            gu = r.stdout.strip()
-        except Exception: pass
-        try:
-            r = subprocess.run(['git', 'config', '--global', 'user.email'],
-                              capture_output=True, text=True)
-            ge = r.stdout.strip()
-        except Exception: pass
+        # 优先读取本地仓库配置 (login 优先写入 --local)
+        repo = _get_t3_repo_path()
+        for scope in (['--local'], ['--global']):
+            if scope == ['--local'] and repo is None:
+                continue
+            cwd = repo if scope == ['--local'] else None
+            try:
+                r = subprocess.run(['git', 'config', *scope, 'user.name'],
+                                  capture_output=True, text=True, cwd=cwd)
+                gu = r.stdout.strip()
+            except Exception: pass
+            try:
+                r = subprocess.run(['git', 'config', *scope, 'user.email'],
+                                  capture_output=True, text=True, cwd=cwd)
+                ge = r.stdout.strip()
+            except Exception: pass
+            if gu:
+                break
         if gu:
             t3_user_var.set(f'已登录: {gu} <{ge or "无邮箱"}>')
             t3_login_btn.configure(text='切换')
@@ -1715,6 +1779,15 @@ def run_gui():
         d = filedialog.askdirectory(title='选择本地工程目录')
         if d:
             t3_path.set(d)
+            # 自动读取该工程的远程地址
+            try:
+                r = subprocess.run(
+                    ['git', '-C', d, 'remote', 'get-url', 'origin'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout.strip():
+                    t3_remote.set(r.stdout.strip())
+            except Exception:
+                pass
 
     ttk.Button(fc3, text='浏览', command=t3_br,
                style='Normal.TButton').grid(
@@ -2337,8 +2410,8 @@ def run_gui():
               foreground=C['sub'], font=(F, 8)).grid(
         row=5, column=2, sticky='w', padx=(0, 14), pady=(2, 8))
 
-    t3_gen_gi = tk.BooleanVar(value=True)
-    ttk.Checkbutton(fc3, text='自动生成 .gitignore (文件全被过滤时可取消)',
+    t3_gen_gi = tk.BooleanVar(value=False)
+    ttk.Checkbutton(fc3, text='按照FPGA规则过滤 (勾选=过滤中间文件 / 不勾=上传全部)',
                     variable=t3_gen_gi).grid(
         row=6, column=0, columnspan=3, sticky='w', padx=14, pady=(2, 8))
 
@@ -2369,23 +2442,42 @@ def run_gui():
             messagebox.showerror('错误', '请先填写远程仓库地址 (SSH 或 HTTP)')
             return
 
-        # 从远程获取分支列表
+        # 从远程获取分支列表 (检测协议放在后台线程里)
         _log(t3_log, '')
         _log(t3_log, f'🔍 查询远程仓库...', C['blue'])
 
         def _bg_list():
+            nonlocal remote_url
             def l(msg, color=None):
                 root.after(0, lambda: _log(t3_log, msg, color or C['fg']))
 
+            # 先直接查, 失败再切协议
+            l('正在查询分支...', C['sub'])
             try:
                 rv = subprocess.run(['git', 'ls-remote', '--heads', remote_url],
                                     capture_output=True, text=True, timeout=15)
             except subprocess.TimeoutExpired:
-                l('查询超时', C['red'])
-                return
+                rv = subprocess.CompletedProcess([''], 1, '', '超时')
             except Exception as e:
-                l(f'查询失败: {e}', C['red'])
-                return
+                rv = subprocess.CompletedProcess([''], 1, '', str(e))
+
+            # 失败自动切另一条路
+            if rv.returncode != 0:
+                sh, ht = _url_to_ssh_and_https(remote_url)
+                alt_url = sh if remote_url.startswith('https://') else ht
+                if alt_url and alt_url != remote_url:
+                    l(f'切换协议重试...', C['yellow'])
+                    try:
+                        rv = subprocess.run(
+                            ['git', 'ls-remote', '--heads', alt_url],
+                            capture_output=True, text=True, timeout=15,
+                            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                                 'GCM_INTERACTIVE': 'Never'})
+                    except Exception:
+                        rv.returncode = 1
+                    if rv.returncode == 0:
+                        remote_url = alt_url
+                        root.after(0, lambda: t3_remote.set(alt_url))
             if rv.returncode != 0:
                 l((rv.stderr or '未知错误').strip()[:300], C['red'])
                 return
@@ -2595,12 +2687,12 @@ def run_gui():
 
     def t3_delete_branch():
         remote_url = t3_remote.get().strip()
-        cur_branch = (t3_branch.get().strip()
-                      or t3_branch_info.get().split('|')[0].replace('\u2714', '').strip()
-                      or '')
         if not remote_url:
             messagebox.showerror('错误', '请先填写远程仓库地址')
             return
+        cur_branch = (t3_branch.get().strip()
+                      or t3_branch_info.get().split('|')[0].replace('\u2714', '').strip()
+                      or '')
         if not cur_branch:
             cur_branch = tk.simpledialog.askstring('分支名', '请输入要删除的远程分支名:', parent=root)
             if not cur_branch:
@@ -2617,15 +2709,47 @@ def run_gui():
         def _bg():
             def l(msg, color=None):
                 root.after(0, lambda: _log(t3_log, msg, color or C['fg']))
-            try:
-                rv = subprocess.run(['git', 'push', 'origin', '--delete', cur_branch],
-                                    capture_output=True, text=True, timeout=30,
-                                    env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'Never'})
-            except subprocess.TimeoutExpired:
-                l('推送超时 (30s)', C['red']); return
-            if rv.returncode == 0:
-                l(rv.stdout.strip(), C['green'])
-                if rv.stderr: l(rv.stderr.strip(), C['yellow'])
+
+            # 后台检测最佳协议
+            nonlocal remote_url
+            sh, ht = _url_to_ssh_and_https(remote_url)
+            best, _ = _detect_reachable_url(sh, ht, timeout=6)
+            if best:
+                remote_url = best
+                root.after(0, lambda: t3_remote.set(best))
+
+            def _do_push(url):
+                """用指定 URL 做 push --delete, 返回 (ok, err_msg)"""
+                # 先设 origin
+                subprocess.run(['git', 'remote', 'set-url', 'origin', url],
+                               capture_output=True, timeout=5)
+                try:
+                    rv = subprocess.run(
+                        ['git', 'push', 'origin', '--delete', cur_branch],
+                        capture_output=True, text=True, timeout=30,
+                        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                             'GCM_INTERACTIVE': 'Never'})
+                    if rv.returncode == 0:
+                        return True, rv.stdout.strip()
+                    return False, (rv.stderr or rv.stdout).strip()[:300]
+                except subprocess.TimeoutExpired:
+                    return False, '连接超时'
+
+            # 尝试当前协议, 失败自动切另一种
+            ok, err = _do_push(remote_url)
+            if not ok:
+                alt_url = None
+                if remote_url.startswith('https://'):
+                    alt_url, _ = _url_to_ssh_and_https(remote_url)
+                elif remote_url.startswith('git@'):
+                    _, alt_url = _url_to_ssh_and_https(remote_url)
+                if alt_url and alt_url != remote_url:
+                    l(f'{err} — 切换到 {alt_url[:8]}... 重试', C['yellow'])
+                    ok, err = _do_push(alt_url)
+                    if ok:
+                        t3_remote.set(alt_url)
+
+            if ok:
                 l(f'\u2714 远程分支 {cur_branch} 已删除', C['green'])
                 # 同步本地仓库引用
                 local_repo = t3_path.get().strip()
@@ -2634,29 +2758,53 @@ def run_gui():
                                    capture_output=True, timeout=15)
                 root.after(500, t3_query_branches)
             else:
-                l((rv.stderr or rv.stdout).strip()[:400], C['red'])
+                l(f'✘ 删除失败: {err}', C['red'])
+                l('HTTPS 和 SSH 均无法连接', C['yellow'])
             root.after(100, t3_history)
         threading.Thread(target=_bg, daemon=True).start()
 
     t3_del_branch_btn.config(command=t3_delete_branch)
 
     def t3_query_branches():
-        """查询远程仓库的分支列表 (git ls-remote)"""
+        """查询远程分支: 自动检测 SSH/HTTPS 可用性, 选能通的协议"""
         url = t3_remote.get().strip()
         if not url:
             t3_branch_info.set('请先输入远程仓库地址')
             return
 
-        _log(t3_log, f'\U0001f50d 正在查询 {url} ...', C['blue'])
-        t3_branch_info.set('查询中...')
+        ssh_url, https_url = _url_to_ssh_and_https(url)
+        _log(t3_log, f'\U0001f50d 检测连通性 ...', C['blue'])
+        t3_branch_info.set('检测网络...')
 
         def _bg():
+            # 先直接查用户选的 URL, 失败再切另一条
+            use_url = url
+            _log(t3_log, f'\U0001f50d 正在查询 {use_url} ...', C['blue'])
+            t3_branch_info.set('查询中...')
+
             try:
-                r = subprocess.run(
-                    ['git', 'ls-remote', '--heads', url],
-                    capture_output=True, text=True, timeout=30,
-                    env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                         'GCM_INTERACTIVE': 'Never'})
+                def _try_query(u):
+                    return subprocess.run(
+                        ['git', 'ls-remote', '--heads', u],
+                        capture_output=True, text=True, timeout=30,
+                        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                             'GCM_INTERACTIVE': 'Never',
+                             'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new'})
+
+                r = _try_query(use_url)
+                # 失败自动切另一条路
+                if r.returncode != 0:
+                    alt_url = ssh_url if use_url.startswith('https://') else https_url
+                    if alt_url and alt_url != use_url:
+                        root.after(0, lambda: _log(
+                            t3_log, f'切换协议重试...', C['yellow']))
+                        try:
+                            r = _try_query(alt_url)
+                        except Exception:
+                            r.returncode = 1
+                        if r.returncode == 0:
+                            t3_remote.set(alt_url)
+                            use_url = alt_url
 
                 if r.returncode != 0:
                     err = (r.stderr or '查询失败').strip()[:200]
@@ -2747,26 +2895,44 @@ def run_gui():
         if not m:
             messagebox.showerror('错误', '请填写改动说明')
             return
+        # 如果远程地址为空但工程目录有 .git, 自动读取 origin
+        if not r and p and os.path.isdir(os.path.join(p, '.git')):
+            try:
+                rv = subprocess.run(
+                    ['git', '-C', p, 'remote', 'get-url', 'origin'],
+                    capture_output=True, text=True, timeout=5)
+                if rv.returncode == 0 and rv.stdout.strip():
+                    r = rv.stdout.strip()
+                    t3_remote.set(r)
+            except Exception:
+                pass
 
         _log(t3_log, '', '')
         _log(t3_log, '\u25b6 开始提交...', C['blue'])
         cm = f'[{d}] {m}'
 
-        # 收集 git 用户信息（顶部 Git 账户栏已处理登录）
+        # 收集 git 用户信息（优先本地仓库, 回退全局 — 与登录逻辑一致）
         git_user = ''
         git_email = ''
-        try:
-            gu = subprocess.run(['git', 'config', '--global', 'user.name'],
-                                capture_output=True, text=True)
-            git_user = gu.stdout.strip()
-        except Exception:
-            pass
-        try:
-            ge = subprocess.run(['git', 'config', '--global', 'user.email'],
-                                capture_output=True, text=True)
-            git_email = ge.stdout.strip()
-        except Exception:
-            pass
+        repo = _get_t3_repo_path()
+        for scope in (['--local'], ['--global']):
+            if scope == ['--local'] and repo is None:
+                continue
+            cwd = repo if scope == ['--local'] else None
+            try:
+                gu = subprocess.run(['git', 'config', *scope, 'user.name'],
+                                    capture_output=True, text=True, cwd=cwd)
+                git_user = gu.stdout.strip()
+            except Exception:
+                pass
+            try:
+                ge = subprocess.run(['git', 'config', *scope, 'user.email'],
+                                    capture_output=True, text=True, cwd=cwd)
+                git_email = ge.stdout.strip()
+            except Exception:
+                pass
+            if git_user:
+                break
 
         if not git_user:
             root.after(0, lambda: _log(
@@ -2777,6 +2943,7 @@ def run_gui():
             return
 
         def _bg():
+            nonlocal r
             def l(msg, color=None):
                 if color is None:
                     color = C['fg']
@@ -2792,14 +2959,21 @@ def run_gui():
                 return
 
             # 2. .gitignore (可选)
+            gi = os.path.join(p, '.gitignore')
             if t3_gen_gi.get():
-                gi = os.path.join(p, '.gitignore')
                 if not os.path.exists(gi):
                     with open(gi, 'w', encoding='utf-8') as f:
                         f.write(_generate_fpga_gitignore())
                     l('\u2714 已自动创建 .gitignore', C['green'])
+                else:
+                    l('.gitignore 已存在, 跳过创建', C['sub'])
             else:
-                l('已跳过 .gitignore 创建', C['sub'])
+                # 不勾选 = 全部上传, 直接删 .gitignore
+                if os.path.exists(gi):
+                    os.remove(gi)
+                    l('\u2714 已删除 .gitignore (全部文件将上传)', C['green'])
+                else:
+                    l('未使用 .gitignore (全部文件将上传)', C['sub'])
 
             # 3. git init
             dg = os.path.join(p, '.git')
@@ -2919,12 +3093,27 @@ def run_gui():
                 if rv.stdout.strip():
                     cur_branch = rv.stdout.strip()
 
-            # 7. git remote + push
+            # 7. git remote + push (自动检测最佳协议)
             if r:
+                l('🔍 检测网络...', C['sub'])
+                ssh_url, https_url = _url_to_ssh_and_https(r)
+                best_url, proto = _detect_reachable_url(ssh_url, https_url)
+                if best_url is None:
+                    l('推送无法进行: SSH 和 HTTPS 均无法连接', C['red'])
+                    l('本地提交已完成, 可稍后手动 push', C['yellow'])
+                    root.after(0, t3_history)
+                    return
+                if best_url != r:
+                    l(f'已自动切换到 {proto.upper()}: {best_url}', C['green'])
+                    r = best_url
+
                 rv = subprocess.run(['git', 'remote', '-v'],
                                     capture_output=True, text=True, cwd=p)
                 if 'origin' in rv.stdout:
-                    l('origin 已存在', C['yellow'])
+                    subprocess.run(
+                        ['git', 'remote', 'set-url', 'origin', r],
+                        capture_output=True, text=True, cwd=p)
+                    l('origin 已更新', C['yellow'])
                 else:
                     r2 = subprocess.run(
                         ['git', 'remote', 'add', 'origin', r],
@@ -2965,36 +3154,51 @@ def run_gui():
                 else:
                     push_branch = cur_branch
 
-                l(f'↑ 推送 {push_branch} → origin ...', C['blue'])
-                push_ok = False
-                try:
+                def _do_push(url):
+                    """推送, 返回 (ok, err_msg)"""
+                    try:
+                        subprocess.run(['git', 'remote', 'set-url', 'origin', url],
+                                       capture_output=True, text=True, cwd=p, timeout=5)
+                    except Exception:
+                        pass  # set-url 失败不阻塞 push
                     push_cmd = ['git', 'push', '-u', 'origin', push_branch]
                     if merge_to_main:
                         push_cmd.insert(2, '--force-with-lease')
-                    rv = subprocess.run(
-                        push_cmd,
-                        capture_output=True, text=True, cwd=p, timeout=90,
-                        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                             'GCM_INTERACTIVE': 'Never'})
-                except subprocess.TimeoutExpired:
-                    l('推送超时 (90s) — 认证卡住', C['red'])
-                    l('建议: 确认 SSH 密钥已添加到 GitHub/GitLab', C['yellow'])
-                    return
-                if rv.returncode == 0:
-                    l(rv.stdout.strip(), C['green'])
-                    if rv.stderr:
-                        l(rv.stderr.strip(), C['yellow'])
+                    try:
+                        rv = subprocess.run(
+                            push_cmd, capture_output=True, text=True,
+                            cwd=p, timeout=20,
+                            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                                 'GCM_INTERACTIVE': 'Never'})
+                        if rv.returncode == 0:
+                            return (True, rv.stdout.strip())
+                        return (False, (rv.stderr or rv.stdout).strip())
+                    except subprocess.TimeoutExpired:
+                        return (False, '连接超时')
+                    except Exception as e:
+                        return (False, str(e)[:200])
+
+                l(f'↑ 推送 {push_branch} → origin ...', C['blue'])
+                push_ok = False
+                ok, err = _do_push(r)
+                if not ok and ('connect' in err.lower() or 'timeout' in err.lower() or 'unable to access' in err.lower() or 'permission denied' in err.lower()):
+                    alt_url = None
+                    if r.startswith('https://'):
+                        alt_url, _ = _url_to_ssh_and_https(r)
+                    elif r.startswith('git@'):
+                        _, alt_url = _url_to_ssh_and_https(r)
+                    if alt_url and alt_url != r:
+                        l(f'{err[:60]} — 切换到 {alt_url[:8]}... 重试', C['yellow'])
+                        ok, err = _do_push(alt_url)
+                        if ok:
+                            t3_remote.set(alt_url)
+
+                if ok:
+                    l((ok if isinstance(ok, str) else 'ok'), C['green'])
                     push_ok = True
                 else:
-                    err = (rv.stderr or rv.stdout).strip()
                     l(err, C['red'])
-                    if 'authentication' in err.lower() or 'credentials' in err.lower():
-                        l('提示: 需要 GitHub 认证。请使用 Personal Access Token', C['yellow'])
-                        l('  Settings → Developer settings → Tokens (classic)', C['sub'])
-                    elif 'remote' in err.lower() and 'not found' in err.lower():
-                        l('提示: 远程仓库不存在或无权限访问', C['yellow'])
-                    elif 'rejected' in err.lower():
-                        l('提示: 推送被拒绝，可能需要先 git pull', C['yellow'])
+                    l('本地提交已完成，可稍后手动 push', C['yellow'])
 
                 # 3) 推送成功后删除源分支 (本地 + 远程)
                 if merge_to_main and push_ok and cur_branch != 'main':
@@ -3037,11 +3241,11 @@ def run_gui():
     def t3_clone_repo():
         """把选好的仓库+分支下载到 t3_path 指定的本地目录"""
         url = t3_remote.get().strip()
-        local = t3_path.get().strip()
-        branch = t3_branch.get().strip()
         if not url:
             messagebox.showerror('错误', '请先填写远程仓库地址')
             return
+        local = t3_path.get().strip()
+        branch = t3_branch.get().strip()
         if not local:
             messagebox.showerror('错误', '请先填写本地工程路径 (作为下载目标)')
             return
@@ -3064,6 +3268,14 @@ def run_gui():
                 if color is None:
                     color = C['fg']
                 root.after(0, lambda: _log(t3_log, msg, color))
+
+            # 后台检测最佳协议
+            nonlocal url
+            sh, ht = _url_to_ssh_and_https(url)
+            best, _ = _detect_reachable_url(sh, ht, timeout=6)
+            if best:
+                url = best
+                root.after(0, lambda: t3_remote.set(best))
 
             try:
                 cmd = ['git', 'clone', url]
@@ -3102,21 +3314,41 @@ def run_gui():
                     l('  建议: 关闭 WinRAR / 资源管理器对此目录的预览后重试',
                       C['yellow'])
 
-                cmd.append(dst)
+                def _do_clone(clone_url):
+                    clone_cmd = ['git', 'clone', clone_url]
+                    if branch:
+                        clone_cmd += ['-b', branch]
+                    clone_cmd.append(dst)
+                    try:
+                        rv = subprocess.run(
+                            clone_cmd, capture_output=True, text=True, timeout=300,
+                            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                                 'GCM_INTERACTIVE': 'Never'})
+                        if rv.returncode == 0:
+                            return (True, rv.stdout.strip())
+                        return (False, (rv.stderr or rv.stdout).strip())
+                    except subprocess.TimeoutExpired:
+                        return (False, '克隆超时')
+
                 l(f'  $ git clone {url}' + (f' -b {branch}' if branch else ''), C['sub'])
-                rv = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=300,
-                    env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                         'GCM_INTERACTIVE': 'Never'})
-                if rv.returncode == 0:
-                    l(rv.stdout.strip(), C['green'])
-                    if rv.stderr:
-                        l(rv.stderr.strip(), C['yellow'])
+                ok, err = _do_clone(url)
+                if not ok and ('connect' in err.lower() or 'unable to access' in err.lower()):
+                    alt_url = None
+                    if url.startswith('https://'):
+                        alt_url, _ = _url_to_ssh_and_https(url)
+                    elif url.startswith('git@'):
+                        _, alt_url = _url_to_ssh_and_https(url)
+                    if alt_url and alt_url != url:
+                        l(f'{err[:60]} — 切换到 {alt_url[:8]}... 重试', C['yellow'])
+                        ok, err = _do_clone(alt_url)
+                        if ok:
+                            t3_remote.set(alt_url)
+
+                if ok:
+                    l((ok if isinstance(ok, str) else 'ok'), C['green'])
                     l(f'✔ 下载完成: {dst}', C['green'])
-                    # 自动填充本地路径
                     root.after(0, lambda: t3_path.set(dst))
                 else:
-                    err = (rv.stderr or rv.stdout).strip()
                     l(f'✘ 克隆失败: {err[:300]}', C['red'])
                     if 'authentication' in err.lower() or 'credentials' in err.lower():
                         l('提示: 需要认证. 使用 SSH 地址 git@github.com:user/repo.git',
@@ -3956,8 +4188,9 @@ def run_gui():
     # ══════════════════════════════════════
     # DocNav 搜索下载 (解析 xdocs.xml → 搜索 → 直链下载 PDF 到 ip_docs/)
     # ══════════════════════════════════════
-    from src.amd_doc_downloader import (
-        find_xdocs_xml, parse_xdocs, search_docs, batch_download,
+    # Use compat layer (19.1/20.x/25.2/future, khub fallback)
+    from src.amd_docnav_compat import (
+        parse_xdocs_compat, search_docs_compat, download_pdf_smart, batch_download_smart,
     )
     from src.app_config import get_xdocs_xml_path as _app_xdocs
 
@@ -4148,7 +4381,7 @@ def run_gui():
             try:
                 all_docs = {}
                 for ekw in expanded_kws:
-                    results = search_docs(ekw, xml_path)
+                    results = search_docs_compat(ekw, xml_path)
                     for d in results:
                         if d['docID'] not in all_docs:
                             all_docs[d['docID']] = d
@@ -4213,12 +4446,13 @@ def run_gui():
 
             for i, doc in enumerate(docs_to_dl):
                 key = doc['docID']
-                url = doc['downloadURL']
+                # Compat dict: prefer downloadURL, fallback to url
+                url = doc.get('downloadURL') or doc.get('url') or ''
                 title_map[key] = doc.get('title', '')
                 output_path = os.path.join(output_dir, f'{key}.pdf')
 
-                from src.amd_doc_downloader import download_pdf as _dl_pdf
-                ok, msg = _dl_pdf(url, output_path)
+                # Smart download: direct URL fails -> AMD khub API fallback
+                ok, msg = download_pdf_smart(url, output_path, doc_id=key)
                 if ok:
                     success_count[0] += 1
                 else:
