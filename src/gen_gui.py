@@ -7511,7 +7511,8 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
     a2 = ttk.Frame(aux_nb, style='TFrame')
     aux_nb.add(a2, text='  时序报告  ')
     a2.grid_columnconfigure(0, weight=1)
-    a2.grid_rowconfigure(5, weight=1)
+    a2.grid_rowconfigure(5, weight=1)   # Treeview
+    a2.grid_rowconfigure(6, weight=0)   # path_detail Text (动态显示/隐藏)
 
     # ── 工程根 + Vivado 路径 (可缺省, 后面手动浏览报告也行) ──
     fa2p = ttk.LabelFrame(a2, text=' 工程信息 (缺报告时自动调 Vivado 生成) ')
@@ -7562,7 +7563,11 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
             _a2_viv_label.config(foreground=C['red'])
             a2_vivado.set('')
             _a2_viv_btn.grid(row=1, column=2, padx=(4, 14), pady=(2, 2))
-        a2_ver_combo['values'] = _t9_extract_versions()
+        versions = _t9_extract_versions()
+        a2_ver_combo['values'] = versions
+        # 默认选第一个可用版本, 避免留空时回退到 PATH 随机版本
+        if versions and not a2_ver.get().strip():
+            a2_ver.set(versions[0])
 
     ttk.Label(fa2p, text='版本:', font=(F, 9)).grid(
         row=2, column=0, sticky='w', padx=(14, 4), pady=(2, 6))
@@ -7570,36 +7575,31 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
                                  width=10, values=_t9_extract_versions())
     a2_ver_combo.grid(row=2, column=1, sticky='w', padx=2, pady=(2, 6))
     _a2_refresh_viv()  # Combobox 创建后调用
-    ttk.Label(fa2p, text='  ⓘ 留空时按 PATH 自动找 vivado',
+    # 监听工程路径变化 → 自动扫描报告 (带防抖, 500ms)
+    _a2_proj_timer = None
+    def _a2_on_proj_change(*_):
+        nonlocal _a2_proj_timer
+        if _a2_proj_timer is not None:
+            a2.after_cancel(_a2_proj_timer)
+        _a2_proj_timer = a2.after(500, _a2_refresh_reports)
+    a2_proj.trace_add('write', _a2_on_proj_change)
+    ttk.Label(fa2p, text='  ⓘ 版本决定用哪个 Vivado 生成报告',
               foreground=C['sub'], font=(F, 8)).grid(
         row=2, column=2, sticky='w', padx=(4, 14), pady=(2, 6))
 
-    ttk.Button(fa2p, text='🔍 检测 / 自动生成报告',
+    # 按钮栏: 统一检测/生成 (timing + cdc 一键搞定)
+    a2_btn_frame = ttk.Frame(fa2p, style='TFrame')
+    a2_btn_frame.grid(row=3, column=0, columnspan=3, sticky='ew', padx=14, pady=(2, 8))
+
+    ttk.Button(a2_btn_frame, text='🔍 检测 / 自动生成报告 (Timing + CDC)',
                command=lambda: _a2_detect_and_gen(),
-               style='Accent.TButton').grid(row=3, column=0, columnspan=3,
-                                            sticky='ew', padx=14, pady=(2, 8))
-    a2_status = tk.StringVar(value='点击上面的按钮自动检测/生成报告, 或直接在下方选已有报告')
+               style='Accent.TButton').grid(row=0, column=0, sticky='ew')
+    a2_status = tk.StringVar(value='填写工程路径后自动搜索报告, 或直接点检测生成')
     ttk.Label(fa2p, textvariable=a2_status, foreground=C['sub'],
               font=(F, 8)).grid(row=4, column=0, columnspan=3,
                                 sticky='w', padx=14, pady=(0, 6))
 
-    # ── 报告路径 (手动选或自动填) ──
-    fa2 = ttk.LabelFrame(a2, text=' 报告路径 ', )
-    fa2.grid(row=1, column=0, sticky='ew', padx=10, pady=4)
-    fa2.grid_columnconfigure(1, weight=1)
-
     a2_path = tk.StringVar()
-    ttk.Entry(fa2, textvariable=a2_path, font=(F, 10)).grid(
-        row=0, column=0, sticky='ew', padx=(14, 4), pady=(8, 4), columnspan=2)
-    ttk.Button(fa2, text='浏览',
-               command=lambda: (f := filedialog.askopenfilename(
-                   title='选择时序报告',
-                   filetypes=[('报告文件','*.rpt;*.txt'),('All','*.*')],
-                   initialdir=a2_path.get() or None)) and a2_path.set(f),
-               style='Normal.TButton').grid(row=0, column=2, padx=(4, 4), pady=(8, 4))
-    ttk.Button(fa2, text='解析', command=lambda: _a2_parse(),
-               style='Accent.TButton').grid(row=0, column=3,
-               padx=(0, 14), pady=(8, 4))
 
     # 摘要行
     fa2s = ttk.LabelFrame(a2, text=' 汇总 ', )
@@ -7617,24 +7617,157 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
                   foreground=C['red']).grid(row=0, column=i*2+1, sticky='w',
                   padx=(0, 14), pady=(6, 6))
 
-    # 路径列表
-    a2_tree = ttk.Treeview(a2, columns=('slack','src','dst','logic'),
+    # ── 视图切换工具栏 ──
+    a2_view = tk.StringVar(value='timing')  # timing | clock_domain | cdc | path_detail
+    fa2v = ttk.Frame(a2, style='TFrame')
+    fa2v.grid(row=4, column=0, columnspan=2, sticky='ew', padx=10, pady=(4, 0))
+    for i, (vid, vlbl, vtip) in enumerate([
+        ('timing', '时序摘要', '违例路径列表'),
+        ('clock_domain', '时钟域', '按时钟对分组统计 WNS/TNS'),
+        ('cdc', 'CDC 检查', '跨时钟域违例分析'),
+        ('path_detail', '路径详情', '展开单条违例路径的 cell-net 明细'),
+    ]):
+        def _switch_view(v=vid):
+            a2_view.set(v)
+            _a2_reconfigure_treeview()
+            _a2_reparse()
+        rb = ttk.Radiobutton(fa2v, text=vlbl, variable=a2_view,
+                             value=vid, command=_switch_view)
+        rb.grid(row=0, column=i, padx=(0, 2), pady=2)
+        # tooltip
+        try:
+            from idlelib.tooltip import Hovertip
+            Hovertip(rb, vtip)
+        except Exception:
+            pass
+
+    # 路径列表 — 列动态切换
+    a2_tree = ttk.Treeview(a2, columns=('col0','col1','col2','col3'),
                           show='headings', selectmode='browse', style='Treeview')
-    a2_tree.heading('slack', text='Slack')
-    a2_tree.heading('src',   text='Source')
-    a2_tree.heading('dst',   text='Destination')
-    a2_tree.heading('logic', text='Logic Levels')
-    a2_tree.column('slack', width=120)
-    a2_tree.column('src',   width=280)
-    a2_tree.column('dst',   width=280)
-    a2_tree.column('logic', width=160)
     a2_tree.grid(row=5, column=0, sticky='nsew', padx=10, pady=(0, 8))
     a2_sc = ttk.Scrollbar(a2, orient='vertical', command=a2_tree.yview)
     a2_sc.grid(row=5, column=1, sticky='ns', pady=(0, 8))
     a2_tree.configure(yscrollcommand=a2_sc.set)
 
+    # 路径详情展开 Text (path_detail 视图用)
+    a2_detail_text = tk.Text(a2, font=(M, 9), height=6, wrap='none',
+                             relief='flat', padx=8, pady=4, bg='#fafbfc',
+                             state='disabled')
+    a2_detail_sc = ttk.Scrollbar(a2, orient='horizontal',
+                                 command=a2_detail_text.xview)
+    a2_detail_text.configure(xscrollcommand=a2_detail_sc.set)
+    # 初始隐藏
+    a2_detail_text.grid_remove()
+    a2_detail_sc.grid_remove()
+
+    def _a2_reconfigure_treeview():
+        """根据 a2_view 切换列头/列宽"""
+        v = a2_view.get()
+        if v == 'timing':
+            a2_tree.configure(columns=('col0','col1','col2','col3'))
+            a2_tree.heading('col0', text='Slack')
+            a2_tree.heading('col1', text='Source')
+            a2_tree.heading('col2', text='Destination')
+            a2_tree.heading('col3', text='Logic Levels')
+            a2_tree.column('col0', width=120)
+            a2_tree.column('col1', width=280)
+            a2_tree.column('col2', width=280)
+            a2_tree.column('col3', width=160)
+            a2_detail_text.grid_remove()
+            a2_detail_sc.grid_remove()
+        elif v == 'clock_domain':
+            a2_tree.configure(columns=('col0','col1','col2','col3'))
+            a2_tree.heading('col0', text='时钟对')
+            a2_tree.heading('col1', text='WNS')
+            a2_tree.heading('col2', text='TNS')
+            a2_tree.heading('col3', text='违例路径数 / 总路径数')
+            a2_tree.column('col0', width=240)
+            a2_tree.column('col1', width=100)
+            a2_tree.column('col2', width=100)
+            a2_tree.column('col3', width=200)
+            a2_detail_text.grid_remove()
+            a2_detail_sc.grid_remove()
+        elif v == 'cdc':
+            a2_tree.configure(columns=('col0','col1','col2','col3'))
+            a2_tree.heading('col0', text='CDC 类型')
+            a2_tree.heading('col1', text='源时钟')
+            a2_tree.heading('col2', text='目标时钟')
+            a2_tree.heading('col3', text='状态')
+            a2_tree.column('col0', width=180)
+            a2_tree.column('col1', width=140)
+            a2_tree.column('col2', width=140)
+            a2_tree.column('col3', width=100)
+            a2_detail_text.grid_remove()
+            a2_detail_sc.grid_remove()
+        elif v == 'path_detail':
+            a2_tree.configure(columns=('col0','col1','col2','col3'))
+            a2_tree.heading('col0', text='Slack')
+            a2_tree.heading('col1', text='Source')
+            a2_tree.heading('col2', text='Destination')
+            a2_tree.heading('col3', text='Logic Levels')
+            a2_tree.column('col0', width=120)
+            a2_tree.column('col1', width=240)
+            a2_tree.column('col2', width=240)
+            a2_tree.column('col3', width=120)
+            # 显示详情面板
+            a2_detail_text.grid(row=6, column=0, sticky='nsew', padx=10, pady=(4, 8))
+            a2_detail_sc.grid(row=7, column=0, sticky='ew', padx=10, pady=(0, 4))
+
+    _a2_reconfigure_treeview()  # 初始列头
+
+    # ── 路径详情: 点击违例路径展开 cell-net 明细 ──
+    def _a2_on_path_select(event):
+        if a2_view.get() != 'path_detail':
+            return
+        sel = a2_tree.selection()
+        if not sel:
+            return
+        vals = a2_tree.item(sel[0], 'values')
+        if not vals or len(vals) < 2:
+            return
+        fp = a2_path.get().strip()
+        if not fp or not os.path.isfile(fp):
+            return
+        try:
+            with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            return
+        # 找匹配的 Source/Dest 路径详情
+        src_str = vals[1]
+        dst_str = vals[2]
+        # 定位 Source 在文本中的位置
+        idx = text.find(src_str)
+        if idx < 0:
+            idx = 0
+        # 截取该路径附近 3000 字符
+        ctx = text[max(0, idx - 200):idx + 3000]
+        # 提取 data path 详情
+        detail_parts = []
+        # 尝试匹配 "Location / Delay type / Incr(ns) / Path(ns) / Netlist Resource(s)"
+        dp = re.search(
+            r'((?:-{3,}.*\n)+.*?(?:Location.*Delay.*Incr.*Path.*Netlist.*\n.*?))'
+            r'(?:\n\s*\n|-----|$)',
+            ctx, re.DOTALL)
+        if dp:
+            detail_parts.append(dp.group(1))
+        else:
+            # 回退: 直接展示找到 Source 后的 40 行
+            lines = ctx.split('\n')
+            detail_parts.append('\n'.join(lines[:40]))
+
+        a2_detail_text.configure(state='normal')
+        a2_detail_text.delete('1.0', 'end')
+        a2_detail_text.insert('1.0', '\n'.join(detail_parts))
+        a2_detail_text.configure(state='disabled')
+
+    a2_tree.bind('<<TreeviewSelect>>', _a2_on_path_select)
+
     def _a2_parse():
         a2_tree.delete(*a2_tree.get_children())
+        a2_detail_text.configure(state='normal')
+        a2_detail_text.delete('1.0', 'end')
+        a2_detail_text.configure(state='disabled')
         fp = a2_path.get().strip()
         if not fp or not os.path.isfile(fp):
             messagebox.showerror('错误', '请选择有效的时序报告文件')
@@ -7646,7 +7779,9 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
             messagebox.showerror('读取失败', str(e))
             return
 
-        # 提取 WNS / TNS
+        view = a2_view.get()
+
+        # ── 始终提取 WNS/TNS ──
         wns = tns = None
         m_wns = re.search(r'WNS[:\s]*([+-]?\d+\.?\d*)\s*(ns|ps)?', text, re.I)
         m_tns = re.search(r'TNS[:\s]*([+-]?\d+\.?\d*)\s*(ns|ps)?', text, re.I)
@@ -7658,11 +7793,8 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
         if wns is not None:
             a2_wns.set(f'{wns:.3f} ns {"⚠" if wns < 0 else "✅"}')
 
-        # 提取违例路径
-        # 匹配格式: Slack (VIOLATED) : -0.123ns
-        #            Source: ... Destination: ... Logic Levels: ...
-        paths = []
-        # 方式1: 结构化解析
+        # ── 通用: 先提取所有违例路径 (供各视图共用) ──
+        all_violated = []  # [(slack, src, dst, logic, ctx_text), ...]
         pattern = re.compile(
             r'Slack\s*\(?VIOLATED\)?\s*:\s*([+-]?\d+\.?\d*)\s*(ns|ps)?.*?'
             r'Source:\s*(.+?)\n.*?'
@@ -7670,44 +7802,147 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
             r'(?:.*?\n)*?'
             r'Logic Levels:\s*(.+?)(?:\n|$)',
             re.IGNORECASE | re.DOTALL)
-
         for m in pattern.finditer(text):
             slack = float(m.group(1))
-            src  = m.group(3).strip()
-            dst  = m.group(4).strip()
-            logic= m.group(5).strip()
-            paths.append((slack, src, dst, logic))
-
-        # 方式2: 如果方式1没找到，尝试更宽松的模式
-        if not paths:
+            src = m.group(3).strip()
+            dst = m.group(4).strip()
+            logic = m.group(5).strip()
+            ctx_zone = text[max(0, m.start()-100):m.end()+200]
+            all_violated.append((slack, src, dst, logic, ctx_zone))
+        if not all_violated:
             for m in re.finditer(
                 r'Slack\s*\(?(VIOLATED|MET)\)?\s*:\s*([+-]?\d+\.?\d*)\s*(ns|ps)?',
                 text, re.I):
                 slack = float(m.group(2))
                 if slack < 0:
-                    # 尝试提取上下文
                     ctx_start = max(0, m.start() - 200)
                     ctx = text[ctx_start:m.end() + 300]
                     src_m = re.search(r'Source:\s*(.+?)\n', ctx)
                     dst_m = re.search(r'Destination:\s*(.+?)\n', ctx)
                     logic_m = re.search(r'Logic Levels:\s*(.+?)(?:\n|$)', ctx)
-                    paths.append((
+                    all_violated.append((
                         slack,
                         src_m.group(1).strip() if src_m else '?',
                         dst_m.group(1).strip() if dst_m else '?',
-                        logic_m.group(1).strip() if logic_m else '?'
+                        logic_m.group(1).strip() if logic_m else '?',
+                        ctx
                     ))
 
-        a2_fail.set(str(len(paths)))
+        # ── 按视图填充 Treeview ──
+        if view == 'timing':
+            a2_fail.set(str(len(all_violated)))
+            for slack, src, dst, logic, _ in all_violated:
+                a2_tree.insert('', 'end',
+                              values=(f'{slack:.3f} ns', src, dst, logic),
+                              tags=('violated',))
 
-        for slack, src, dst, logic in paths:
-            tag = 'violated' if slack < 0 else 'met'
-            a2_tree.insert('', 'end',
-                          values=(f'{slack:.3f} ns', src, dst, logic),
-                          tags=(tag,))
+        elif view == 'clock_domain':
+            # 按时钟对分组
+            clock_groups = {}  # {(src_clk, dst_clk): [wnses, tnses, path_count]}
+            # 提取时钟域: Source 中以 '/' 结尾的时钟名或前缀
+            clk_re = re.compile(r'(?:clk|clock)[_\s]*(\w+)', re.I)
+            def _extract_clk(s):
+                m = clk_re.search(s)
+                return m.group(0) if m else '?'
+            for slack, src, dst, logic, _ in all_violated:
+                sc = _extract_clk(src)
+                dc = _extract_clk(dst)
+                key = (sc, dc)
+                if key not in clock_groups:
+                    clock_groups[key] = {'wns': slack, 'tns': slack, 'cnt': 0}
+                else:
+                    clock_groups[key]['wns'] = min(clock_groups[key]['wns'], slack)
+                    clock_groups[key]['tns'] += slack
+                    clock_groups[key]['cnt'] += 1
+                clock_groups[key]['cnt'] += 1
+
+            # 也提取 report_timing_summary 中的时钟对表格
+            clk_pair_pattern = re.compile(
+                r'From Clock:\s*(\S+).*?To Clock:\s*(\S+).*?WNS\(ns\).*?TNS\(ns\).*?'
+                r'([+-]?\d+\.?\d*).*?([+-]?\d+\.?\d*).*?'
+                r'Failing Endpoints:\s*(\d+).*?Total Endpoints:\s*(\d+)',
+                re.IGNORECASE | re.DOTALL)
+            # 简化版: 找每行 "| Clock Pair |"
+            for line in text.split('\n'):
+                # 找 "from_clock  →  to_clock" 模式
+                m2 = re.search(
+                    r'(\w+)\s*(?:to|->|→)\s*(\w+).*?'
+                    r'([+-]?\d+\.?\d+).*?([+-]?\d+\.?\d+).*?'
+                    r'(\d+).*?(\d+)',
+                    line, re.I)
+                if m2:
+                    sc, dc, w, t, fail_n, total_n = m2.groups()
+                    key = (sc.strip(), dc.strip())
+                    if key not in clock_groups:
+                        clock_groups[key] = {'wns': float(w), 'tns': float(t), 'cnt': 0}
+
+            a2_fail.set(str(len(clock_groups)) + ' 对')
+            for (sc, dc), info in sorted(clock_groups.items(),
+                                          key=lambda x: x[1]['wns']):
+                tag = 'violated' if info['wns'] < 0 else 'met'
+                a2_tree.insert('', 'end',
+                              values=(
+                                  f'{sc} → {dc}',
+                                  f'{info["wns"]:.3f} ns',
+                                  f'{info["tns"]:.3f} ns',
+                                  f'{info["cnt"]} 条' if info['cnt'] > 0 else '—',
+                              ),
+                              tags=(tag,))
+
+        elif view == 'cdc':
+            # CDC 解析: 从 report_cdc 输出提取
+            cdc_items = []
+            # 模式1: "Unsafe CDC" / "CDC-unsafe" 类关键词
+            for m in re.finditer(
+                r'(Unsafe\s*CDC|CDC-?\s*unsafe|No\s*Constraint).*?'
+                r'(?:From\s+Clock\s*:\s*(\S+))?.*?'
+                r'(?:To\s+Clock\s*:\s*(\S+))?',
+                text, re.I | re.DOTALL):
+                ctype = m.group(1).strip()
+                src_c = m.group(2) or '?'
+                dst_c = m.group(3) or '?'
+                cdc_items.append((ctype, src_c, dst_c, '🔴 危险'))
+
+            # 模式2: CDC path 列表
+            for m in re.finditer(
+                r'(?:CDC Path|Cross Clock Domain).*?:\s*(\S+)\s*→\s*(\S+)',
+                text, re.I):
+                cdc_items.append(('跨时钟域路径', m.group(1), m.group(2), '🟡 需检查'))
+
+            # 模式3: 宽松匹配 "From Clock" + "To Clock" + "unsafe"
+            for m in re.finditer(
+                r'From\s+Clock\s*:\s*(\S+)\s+To\s+Clock\s*:\s*(\S+)\s+'
+                r'(.*?unsafe.*?|.*?CDC.*?)',
+                text, re.I | re.DOTALL):
+                src_c, dst_c, desc = m.groups()
+                cdc_items.append((desc.strip()[:60], src_c, dst_c, '🔴 危险'))
+
+            a2_fail.set(str(len(cdc_items)))
+            if not cdc_items:
+                a2_tree.insert('', 'end',
+                              values=('(未检测到 CDC 违例)', '', '', '✅ 安全'),
+                              tags=('met',))
+            else:
+                for ctype, sc, dc, status in cdc_items:
+                    tag = 'violated' if '危险' in status else 'met'
+                    a2_tree.insert('', 'end',
+                                  values=(ctype, sc, dc, status),
+                                  tags=(tag,))
+
+        elif view == 'path_detail':
+            a2_fail.set(str(len(all_violated)))
+            for slack, src, dst, logic, _ in all_violated:
+                a2_tree.insert('', 'end',
+                              values=(f'{slack:.3f} ns', src, dst, logic),
+                              tags=('violated',))
 
         a2_tree.tag_configure('violated', foreground=C['red'])
         a2_tree.tag_configure('met', foreground=C['green'])
+
+    def _a2_reparse():
+        """视图切换时重新解析 (如果已有文件路径)"""
+        if a2_path.get().strip():
+            _a2_parse()
 
     # ══════════════════════════════════════════════════════════
     # 自动检测 / 生成 时序报告
@@ -7755,35 +7990,98 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
         import shutil
         return shutil.which('vivado') or shutil.which('vivado.bat')
 
-    def _a2_scan_reports(project_dir):
-        """扫描工程下所有可能的时序报告文件"""
-        cands = []
+    def _a2_scan_reports(project_dir, max_depth=4):
+        """递归扫描工程树下所有 .rpt 报告文件, 按类型分类并排序
+
+        返回: [(fullpath, category, label), ...]
+          category: 'timing' | 'cdc' | 'util' | 'drc' | 'other'
+          label: 用于 Combobox 显示 (含相对路径和文件时间)
+        搜索策略:
+          1. 标准 Vivado 结构: *.runs/{impl_N,synth_N}/*.rpt
+          2. 工程根目录: *.rpt
+          3. 递归子目录 (排除 .git, .Xil, __pycache__, ip_cache 等)
+        """
+        results = []
         if not project_dir or not os.path.isdir(project_dir):
-            return cands
-        # 优先: *.runs/impl_1/*_timing_summary_routed.rpt (Vivado 默认)
-        runs = os.path.join(project_dir, f'{os.path.basename(project_dir)}.runs')
-        if not os.path.isdir(runs):
-            # 找 .runs 目录
-            for d in os.listdir(project_dir):
-                full = os.path.join(project_dir, d)
-                if d.endswith('.runs') and os.path.isdir(full):
-                    runs = full
-                    break
-        if os.path.isdir(runs):
-            for step in ('impl_1', 'synth_1'):
-                sd = os.path.join(runs, step)
-                if os.path.isdir(sd):
-                    for f in os.listdir(sd):
-                        if f.endswith('.rpt') and ('timing' in f.lower() or 'utilization' in f.lower() or 'route' in f.lower() or 'opt' in f.lower()):
-                            cands.append(os.path.join(sd, f))
-        # 次选: 工程根下所有 .rpt
-        for f in os.listdir(project_dir):
-            if f.endswith('.rpt'):
-                cands.append(os.path.join(project_dir, f))
-        return cands
+            return results
+
+        def _cat(fname):
+            """根据文件名推断报告类别"""
+            fn = fname.lower()
+            if 'cdc' in fn:
+                return 'cdc'
+            if 'timing' in fn or 'route' in fn:
+                return 'timing'
+            if 'util' in fn or 'utilization' in fn:
+                return 'util'
+            if 'drc' in fn or 'methodology' in fn:
+                return 'drc'
+            return 'other'
+
+        _SKIP_DIRS = {'.git', '.Xil', '__pycache__', 'ip_cache', '.idea', 'hw_handoff',
+                       'ip', 'bd', 'srcs', 'sim', '.run', 'NA', 'xsim.dir'}
+        _SKIP_PREFIXES = ('.', '_')
+
+        def _scan_dir(d, depth):
+            if depth < 0:
+                return
+            try:
+                items = os.listdir(d)
+            except (OSError, PermissionError):
+                return
+            for item in items:
+                fp = os.path.join(d, item)
+                try:
+                    if os.path.isfile(fp) and item.lower().endswith('.rpt'):
+                        cat = _cat(item)
+                        mtime = os.path.getmtime(fp)
+                        # 构建显示标签: 类别图标 + 相对路径 + 时间
+                        rel = os.path.relpath(fp, project_dir)
+                        if len(rel) > 80:
+                            rel = '...' + rel[-77:]
+                        cat_icon = {'timing':'⏱', 'cdc':'🛡', 'util':'📊', 'drc':'⚠', 'other':'📄'}.get(cat, '📄')
+                        ts = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
+                        label = f'{cat_icon} [{cat.upper():5s}] {ts}  {rel}'
+                        results.append((fp, cat, label, mtime))
+                    elif os.path.isdir(fp) and not item.startswith(_SKIP_PREFIXES) and item not in _SKIP_DIRS:
+                        _scan_dir(fp, depth - 1)
+                except (OSError, PermissionError):
+                    continue
+
+        _scan_dir(project_dir, max_depth)
+
+        # 排序: 按类别优先级 (timing > cdc > util > drc > other), 同类别按时间降序
+        _cat_order = {'timing': 0, 'cdc': 1, 'util': 2, 'drc': 3, 'other': 4}
+        results.sort(key=lambda x: (_cat_order.get(x[1], 9), -x[3]))
+        return results
+
+    def _a2_refresh_reports():
+        """刷新报告下拉框: 扫描工程目录, 填充 Combobox"""
+        proj = a2_proj.get().strip()
+        if not proj or not os.path.isdir(proj):
+            a2_status.set('⚠ 请先填写 Vivado 工程路径')
+            return
+        results = _a2_scan_reports(proj)
+        if not results:
+            a2_status.set('⚠ 工程下未找到 .rpt 报告, 点"检测/自动生成报告"后台生成')
+            return
+        # 选第一个 (优先级排序: timing > cdc > util > ...)
+        best_fp = results[0][0]
+        best_cat = results[0][1]
+        a2_path.set(best_fp)
+        n_timing = len([r for r in results if r[1] == 'timing'])
+        n_cdc = len([r for r in results if r[1] == 'cdc'])
+        a2_status.set(f'✔ 自动搜索: {len(results)} 个报告 ({n_timing} timing, {n_cdc} cdc), 已解析 {best_cat}')
+        _a2_parse()
 
     def _a2_detect_and_gen():
-        """主入口: 检测报告存在性, 缺哪个用 Vivado 生成哪个"""
+        """统一检测/生成入口: 扫描工程 → 有报告就解析, 缺什么就后台生成
+
+        优先级:
+          1. 已有 impl timing 报告 + CDC 报告 → 直接刷新解析
+          2. 有 impl timing 但缺 CDC → 生成 CDC (需要 synth_1)
+          3. 无 impl timing → 跑 synth+impl (同时生成 timing+CDC)
+        """
         proj = a2_proj.get().strip()
         viv = a2_vivado.get().strip()
         if not proj:
@@ -7794,69 +8092,140 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
             messagebox.showerror('错误', f'在 {proj} 下未找到 .xpr 工程文件')
             return
 
-        existing = _a2_scan_reports(proj)
-        # 区分: 已经有时序摘要 (impl) vs 仅 synth 报告
-        has_impl_timing = any(('impl' in p) and ('timing' in p.lower() or 'route' in p.lower()) for p in existing)
-        has_synth = any('synth_1' in p for p in existing)
+        results = _a2_scan_reports(proj)
+        all_paths = [r[0] for r in results]
+        has_impl_timing = any(('impl' in p) and ('timing' in p.lower() or 'route' in p.lower()) for p in all_paths)
+        has_cdc = any('cdc' in p.lower() for p in all_paths)
+        has_synth = any('synth_1' in p for p in all_paths)
 
-        a2_status.set(f'检测到 {len(existing)} 个已有报告' + (' (含时序)' if has_impl_timing else ''))
-
-        if has_impl_timing:
-            # 直接用最新 impl 时序报告
-            best = max((p for p in existing if 'impl' in p and 'timing' in p.lower()),
-                       key=os.path.getmtime, default=None)
-            if best is None:
-                best = max(existing, key=os.path.getmtime)
-            a2_path.set(best)
-            a2_status.set(f'✔ 找到时序报告: {os.path.basename(best)}  —  自动填入')
-            _a2_parse()
+        # ── 情况1: 时序报告和 CDC 都有, 直接分析 ──
+        if has_impl_timing and has_cdc:
+            _a2_refresh_reports()
             return
 
-        # 缺时序报告 → 跑 Vivado 生成
+        # ── 情况2: 有时序但缺 CDC ──
+        if has_impl_timing and not has_cdc:
+            if not has_synth:
+                # 需要 synth 后才能出 CDC
+                a2_status.set('⏳ 有时序但缺 CDC, 先跑 synth_1 再生成 ...')
+                _a2_run_vivado(xpr, viv,
+                    ['open_project "{}"'.format(xpr),
+                     'launch_runs synth_1 -to_step write_synth_checkpoint -jobs 4',
+                     'wait_on_run synth_1',
+                     'open_run synth_1',
+                     'report_cdc -file [get_property DIRECTORY [current_run]]/synth_1_cdc.rpt',
+                     'exit'],
+                    on_done=lambda: _a2_after_gen(xpr))
+            else:
+                a2_status.set('⏳ 生成 CDC 报告 ... (可能 2-5 分钟)')
+                _a2_run_vivado(xpr, viv,
+                    ['open_project "{}"'.format(xpr),
+                     'open_run synth_1',
+                     'report_cdc -file [get_property DIRECTORY [current_run]]/synth_1_cdc.rpt',
+                     'exit'],
+                    on_done=lambda: _a2_after_gen(xpr))
+            return
+
+        # ── 情况3: 缺时序报告 → 跑 synth+impl (一次出 timing+path_detail+CDC) ──
         if not has_synth:
-            # 先 synth, 再 impl 才能出时序
-            a2_status.set('⏳ 工程还未综合, 先跑 synth_1 + impl_1 ... (可能 5-30 分钟)')
+            a2_status.set('⏳ 工程还未综合, 跑 synth_1 + impl_1 生成全部报告 ... (可能 5-30 分钟)')
+            tcl = [
+                  'open_project "{}"'.format(xpr),
+                  'launch_runs synth_1 -to_step write_synth_checkpoint -jobs 4',
+                  'wait_on_run synth_1',
+                  'open_run synth_1',
+                  'report_cdc -file [get_property DIRECTORY [current_run]]/synth_1_cdc.rpt',
+                  'launch_runs impl_1 -to_step write_bitstream -jobs 4',
+                  'wait_on_run impl_1',
+                  'open_run impl_1',
+                  'report_timing_summary -delay_type max -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed.rpt',
+                  'report_timing_summary -delay_type min -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed_min.rpt',
+                  'report_timing -delay_type max -max_paths 10 -nworst 3 -detail_type full_path -file [get_property DIRECTORY [current_run]]/impl_1_timing_path_detail.rpt',
+                  'exit']
+        else:
+            a2_status.set('⏳ 工程已综合, 跑 impl_1 生成时序报告 ... (可能 5-15 分钟)')
+            tcl = [
+                  'open_project "{}"'.format(xpr),
+                  'open_run synth_1',
+                  'report_cdc -file [get_property DIRECTORY [current_run]]/synth_1_cdc.rpt',
+                  'launch_runs impl_1 -to_step write_bitstream -jobs 4',
+                  'wait_on_run impl_1',
+                  'open_run impl_1',
+                  'report_timing_summary -delay_type max -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed.rpt',
+                  'report_timing_summary -delay_type min -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed_min.rpt',
+                  'report_timing -delay_type max -max_paths 10 -nworst 3 -detail_type full_path -file [get_property DIRECTORY [current_run]]/impl_1_timing_path_detail.rpt',
+                  'exit']
+        _a2_run_vivado(xpr, viv, tcl, on_done=lambda: _a2_after_gen(xpr))
+
+    def _a2_after_gen(xpr):
+        """Vivado 跑完后重新扫描, 填入最新报告并解析"""
+        _a2_refresh_reports()
+
+    def _a2_gen_cdc():
+        """生成 CDC 报告 (report_cdc) 并切换到 CDC 视图"""
+        proj = a2_proj.get().strip()
+        if not proj:
+            messagebox.showerror('错误', '请先填写 Vivado 工程路径 (含 .xpr 的目录)')
+            return
+        xpr = _a2_find_xpr(proj)
+        if not xpr:
+            messagebox.showerror('错误', f'在 {proj} 下未找到 .xpr 工程文件')
+            return
+        viv = a2_vivado.get().strip()
+
+        # 先检查是否已有 CDC 报告
+        results = _a2_scan_reports(proj)
+        all_paths = [r[0] for r in results]
+        cdc_reports = [p for p in all_paths if 'cdc' in p.lower()]
+        if cdc_reports:
+            best = max(cdc_reports, key=os.path.getmtime)
+            a2_path.set(best)
+            a2_view.set('cdc')
+            _a2_reconfigure_treeview()
+            _a2_parse()
+            a2_status.set(f'✔ 找到已有 CDC 报告: {os.path.basename(best)}')
+            return
+
+        # 需检查是否已综合 (CDC 需要 synth 后的网表)
+        has_synth = any('synth_1' in p for p in all_paths)
+        if not has_synth:
+            a2_status.set('⏳ 工程未综合, 先跑 synth_1 再生成 CDC ... (可能 5-15 分钟)')
             _a2_run_vivado(xpr, viv,
                 [
                   'open_project "{}"'.format(xpr),
                   'launch_runs synth_1 -to_step write_synth_checkpoint -jobs 4',
                   'wait_on_run synth_1',
-                  'launch_runs impl_1 -to_step write_bitstream -jobs 4',
-                  'wait_on_run impl_1',
-                  'open_run impl_1',
-                  'report_timing_summary -delay_type max -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed.rpt',
-                  'report_timing_summary -delay_type min -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed_min.rpt',
+                  'open_run synth_1',
+                  'report_cdc -file [get_property DIRECTORY [current_run]]/synth_1_cdc.rpt',
                   'exit',
                 ],
-                on_done=lambda: _a2_after_gen(xpr))
+                on_done=lambda: _a2_after_cdc(xpr))
         else:
-            # 已有 synth, 跑 impl 出时序
-            a2_status.set('⏳ 工程已综合, 跑 impl_1 生成时序报告 ... (可能 5-15 分钟)')
+            a2_status.set('⏳ 生成 CDC 报告 ... (可能 2-5 分钟)')
             _a2_run_vivado(xpr, viv,
                 [
                   'open_project "{}"'.format(xpr),
-                  'launch_runs impl_1 -to_step write_bitstream -jobs 4',
-                  'wait_on_run impl_1',
-                  'open_run impl_1',
-                  'report_timing_summary -delay_type max -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed.rpt',
-                  'report_timing_summary -delay_type min -max_paths 10 -file [get_property DIRECTORY [current_run]]/impl_1_timing_summary_routed_min.rpt',
+                  'open_run synth_1',
+                  'report_cdc -file [get_property DIRECTORY [current_run]]/synth_1_cdc.rpt',
                   'exit',
                 ],
-                on_done=lambda: _a2_after_gen(xpr))
+                on_done=lambda: _a2_after_cdc(xpr))
 
-    def _a2_after_gen(xpr):
-        """Vivado 跑完后重新扫描, 填入最新报告并解析"""
+    def _a2_after_cdc(xpr):
+        """CDC 报告生成后回调"""
         proj = a2_proj.get().strip()
-        reports = _a2_scan_reports(proj)
-        # 找带 timing 的
-        timing_reports = [p for p in reports if 'timing' in p.lower()]
-        if timing_reports:
-            best = max(timing_reports, key=os.path.getmtime)
+        results = _a2_scan_reports(proj)
+        all_paths = [r[0] for r in results]
+        cdc_reports = [p for p in all_paths if 'cdc' in p.lower()]
+        if cdc_reports:
+            best = max(cdc_reports, key=os.path.getmtime)
             a2_path.set(best)
-            a2_status.set(f'✔ Vivado 已生成: {os.path.basename(best)}  —  自动解析')
+            a2_view.set('cdc')
+            _a2_reconfigure_treeview()
             _a2_parse()
+            a2_status.set(f'✔ CDC 报告已生成: {os.path.basename(best)}')
         else:
-            a2_status.set('⚠ Vivado 跑完但未找到 timing 报告, 请检查工程')
+            a2_status.set('⚠ Vivado 跑完但未找到 CDC 报告, 请检查 synth_1 是否成功')
 
     def _a2_run_vivado(xpr, vivado_path, tcl_cmds, on_done=None):
         """在后台线程跑 vivado -mode batch -source <tmp.tcl>"""
@@ -10769,39 +11138,45 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
         main = ttk.Frame(win, style='TFrame', padding=12)
         main.pack(fill='both', expand=True)
 
-        # ── 分组 1: 协议 + 模式 + 速率 (目标IP/端口/长度已合并到报文结构) ──
+        # ── 分组 1: 协议 + 模式 + 速率 + 长度 (一行) ──
         gp1 = ttk.LabelFrame(main, text=' 协议设置 ')
         gp1.pack(fill='x', pady=(0, 8))
-        for c in range(6):
+        for c in range(10):
             gp1.grid_columnconfigure(c, weight=0)
-        gp1.grid_columnconfigure(1, weight=1)
-        gp1.grid_columnconfigure(3, weight=1)
-        gp1.grid_columnconfigure(5, weight=1)
+        gp1.grid_columnconfigure(9, weight=1)
 
         ttk.Label(gp1, text='协议', font=(F, 9, 'bold'),
-                  foreground=C['blue']).grid(row=0, column=0, padx=(10, 4),
+                  foreground=C['blue']).grid(row=0, column=0, padx=(8,2),
                                              pady=8, sticky='w')
         ttk.Combobox(gp1, textvariable=t11_proto,
                      values=['UDP','TCP','ICMP','ARP'],
                      state='readonly', font=(F, 10), width=6).grid(
-            row=0, column=1, sticky='w', padx=(0, 12))
+            row=0, column=1, sticky='w', padx=(0, 6))
 
         ttk.Label(gp1, text='模式', font=(F, 9),
-                  foreground=C['sub']).grid(row=0, column=2, padx=(0, 4),
+                  foreground=C['sub']).grid(row=0, column=2, padx=(4,2),
                                              pady=8, sticky='w')
         ttk.Combobox(gp1, textvariable=t11_mode,
                      values=['random','zero','ff','aa','inc','custom'],
-                     state='readonly', font=(F, 10), width=8).grid(
-            row=0, column=3, sticky='w', padx=(0, 12), pady=8)
+                     state='readonly', font=(F, 10), width=7).grid(
+            row=0, column=3, sticky='w', padx=(0, 6))
 
         ttk.Label(gp1, text='速率', font=(F, 9),
-                  foreground=C['sub']).grid(row=0, column=4, padx=(0, 4),
+                  foreground=C['sub']).grid(row=0, column=4, padx=(4,2),
                                              pady=8, sticky='w')
         ttk.Entry(gp1, textvariable=t11_rate, font=(M, 10),
-                  width=5).grid(row=0, column=5, sticky='w', padx=(0, 4), pady=8)
+                  width=5).grid(row=0, column=5, sticky='w', padx=(0, 2), pady=8)
         ttk.Label(gp1, text='包/秒', font=(F, 9),
-                  foreground=C['sub']).grid(row=0, column=5, sticky='e',
-                                             padx=(0, 10), pady=8)
+                  foreground=C['sub']).grid(row=0, column=6, padx=(2,6), pady=8)
+
+        ttk.Separator(gp1, orient='vertical').grid(
+            row=0, column=7, sticky='ns', padx=4, pady=5)
+
+        ttk.Label(gp1, text='长度', font=(F, 9),
+                  foreground=C['sub']).grid(row=0, column=8, padx=(2,2),
+                                             pady=8, sticky='w')
+        len_entry = ttk.Entry(gp1, textvariable=t11_len, font=(M, 10), width=5)
+        len_entry.grid(row=0, column=9, sticky='w', padx=(0, 2), pady=8)
 
         # ── 分组 2: 报文结构 (可编辑 Treeview, 双击行编辑字段) ──
         gp2 = ttk.LabelFrame(main, text=' 报文结构 (双击行编辑字段值) ')
@@ -10845,11 +11220,41 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
         pkt_hex_text = tk.Text(gp3, font=(M, 10), height=4, wrap='word',
                                relief='flat', padx=8, pady=4, bg='#fafbfc',
                                undo=True)
-        pkt_hex_text.grid(row=0, column=0, sticky='nsew', padx=4, pady=4)
+        pkt_hex_text.grid(row=0, column=0, sticky='nsew', padx=4, pady=(4,0))
         pkt_hex_sc = ttk.Scrollbar(gp3, orient='vertical',
                                   command=pkt_hex_text.yview)
-        pkt_hex_sc.grid(row=0, column=1, sticky='ns', padx=(0, 4), pady=4)
+        pkt_hex_sc.grid(row=0, column=1, sticky='ns', padx=(0, 4), pady=(4,0))
         pkt_hex_text.configure(yscrollcommand=pkt_hex_sc.set)
+
+        # 实时字节计数器
+        _pkt_byte_label = ttk.Label(gp3, text='', font=(F, 8),
+                                     foreground=C['sub'])
+        _pkt_byte_label.grid(row=1, column=0, sticky='w', padx=8, pady=(0, 4))
+
+        def _update_byte_counter(*_):
+            try:
+                h = re.sub(r'[\s,;]+', '', pkt_hex_text.get('1.0', 'end-1c'))
+                n = len(bytes.fromhex(h)) if h else 0
+                try:
+                    target = int(t11_len.get())
+                except ValueError:
+                    target = 0
+                if t11_mode.get() == 'custom' and target > 0 and target != n:
+                    _pkt_byte_label.config(
+                        text=f'🞕 当前 {n} 字节 → 发送时按设置长度截断/补零到 {target} 字节',
+                        foreground='#d97706')
+                else:
+                    _pkt_byte_label.config(
+                        text=f'🞕 当前 {n} 字节',
+                        foreground=C['sub'])
+            except Exception:
+                _pkt_byte_label.config(text='')
+        pkt_hex_text.bind('<<Modified>>',
+                          lambda e: (pkt_hex_text.edit_modified(False),
+                                     root.after_idle(_update_byte_counter)))
+        t11_len.trace_add('write', _update_byte_counter)
+        t11_mode.trace_add('write', _update_byte_counter)
+        root.after(50, _update_byte_counter)
 
         # 弹窗内 Text <-> StringVar 双向同步
         _t11_pkt_guard = [False]
@@ -11880,8 +12285,24 @@ pre {{ background: #1e1e1e; color: #d4d4d4; padding: 16px;
             _t11_log('错误: 自定义Hex 格式无效', direction='系统')
             return False
 
+        # custom 模式: 按 t11_len 自动补零/截断到目标长度
+        _mode = stream.get('mode', 'random')
+        if _mode == 'custom':
+            try:
+                target_len = max(0, min(int(stream.get('len', '0')), 65536))
+            except ValueError:
+                target_len = len(data)  # 无效则不干预
+            if target_len > 0 and target_len != len(data):
+                if target_len > len(data):
+                    # 补零到目标长度
+                    data += b'\x00' * (target_len - len(data))
+                else:
+                    # 截断
+                    data = data[:target_len]
+
         # 自动重算 checksum, 确保发送的包校验正确
         _recalc_all_checksums(data)
+        data = bytes(data)  # bytearray → bytes (ctypes.create_string_buffer 只认 bytes)
 
         # --- 默认发送: raw 优先 (ARP/ICMP/UDP/TCP/自定义), 失败回退 UDP socket ---
         if not data:
